@@ -1,20 +1,28 @@
 
-const express = require("express");
-const connectDb = require("./src/config/db");
-const requestController = require("./src/controllers/request_conroller");
-const authController = require("./src/controllers/auth_controller");    
-const cors = require("cors");
 require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+
+const connectDb = require("./src/config/db");
+
+const requestController = require("./src/controllers/request_conroller");
+const authController = require("./src/controllers/auth_controller");
+
+const {
+  startWhatsAppWatcher,
+} = require("./src/whatsapp");
 
 const app = express();
 
+// CORS configuration
 app.use(
   cors({
     origin: [
-   "https://www.onlinesolutionhub.com",
-   "https://onlinesolutionhub.com",
-   "http://localhost:5173"
-  ],
+      "https://www.onlinesolutionhub.com",
+      "https://onlinesolutionhub.com",
+      "http://localhost:5173",
+    ],
   })
 );
 
@@ -45,10 +53,10 @@ app.delete(
   requestController.deleteRequest
 );
 
-// admin register and employee register route
-app.post("/api/register",authController.registerUser);
+// Admin registration
+app.post("/api/register", authController.registerUser);
 
-// admin and employee login route
+// Admin login
 app.post("/api/login", authController.loginUser);
 
 // Unknown routes
@@ -62,13 +70,40 @@ const PORT = process.env.PORT || 3000;
 
 async function startServer() {
   try {
+    // Connect to MongoDB first
     await connectDb();
 
-    app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
+    console.log("MongoDB connected successfully");
+
+    // Start the API server
+    const server = app.listen(PORT, () => {
+      console.log(
+        `OnlineSolutionHub backend is running on port ${PORT}`
+      );
+
+      // Start WhatsApp watcher after MongoDB is connected
+      try {
+        startWhatsAppWatcher();
+
+        console.log("WhatsApp watcher initialization requested");
+      } catch (error) {
+        console.error(
+          "WhatsApp watcher startup failed:",
+          error.message
+        );
+      }
+    });
+
+    // Handle unexpected server errors
+    server.on("error", (error) => {
+      console.error("HTTP server error:", error.message);
     });
   } catch (error) {
-    console.error("Failed to connect to MongoDB:", error.message);
+    console.error(
+      "Failed to start OnlineSolutionHub backend:",
+      error.message
+    );
+
     process.exit(1);
   }
 }

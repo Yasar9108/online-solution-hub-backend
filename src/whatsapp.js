@@ -1,181 +1,180 @@
-
-require("dotenv").config();
-
 const mongoose = require("mongoose");
 const Request = require("./models/request_model");
 
 const {
-    initializeWhatsApp,
-    sendWhatsAppMessage,
-    getWhatsAppStatus
+  initializeWhatsApp,
+  sendWhatsAppMessage,
+  getWhatsAppStatus,
 } = require("./services/watsup.service");
 
 const LOG_TAG = "[WhatsApp Watcher] ==>";
 
 const POLL_INTERVAL = 10000;
-const processedRequestIds = new Set();
+const MAX_ATTEMPTS = 3;
 
 let isChecking = false;
 let pollIntervalId = null;
+let readyCheckId = null;
+let started = false;
 
-// Keys must exactly match requestType values in MongoDB.
-const SERVICE_LINKS = {
-    "Ration Card":
-        "https://play.google.com/store/apps/details?id=in.gov.karnataka.ahara.annaseva",
-
-    "RATION CARD e-KYC":
-        "https://play.google.com/store/apps/details?id=in.gov.karnataka.ahara.annaseva"
-};
-
-function createCustomerMessage(request) {
-    const serviceLink = SERVICE_LINKS[request.requestType];
-
-    if (!serviceLink) {
-        console.warn(
-            LOG_TAG,
-            "Configure a verified link for:",
-            request.requestType
-        );
-
-        return null;
-    }
-
- 
-function createCustomerMessage(request) {
-    return [
-        "Hi from OSH Team! 👋",
-        "",
-        "Your payment has been accepted by OnlineSolutionHub.",
-        `Service: ${request.requestType}`,
-        `Request ID: ${request._id}`,
-        "",
-        "📱 ANDROID APP:",
-        "Download Anna Seve here:",
-        "https://play.google.com/store/apps/details?id=in.gov.karnataka.ahara.annaseva",
-        "",
-        " IPHONE APP:",
-        "Check the Apple App Store here:",
-        "https://apps.apple.com/in/search?term=Anna%20Seve",
-        "",
-        "If you need assistance with ration card e-KYC, please contact Team OSH.",
-        "",
-        "Thank you for choosing OnlineSolutionHub! ❤️"
-    ].join("\n");
+function isRationCardService(requestType) {
+  return /ration|anna/i.test(String(requestType || ""));
 }
 
+function createCustomerMessage(request) {
+  const lines = [
+    "Hi from OSH Team! 👋",
+    "",
+    "Your payment has been accepted by OnlineSolutionHub.",
+    `Service: ${request.requestType}`,
+    `Request ID: ${request._id}`,
+    "",
+  ];
+
+  if (isRationCardService(request.requestType)) {
+    lines.push(
+      "📱 ANDROID APP:",
+      "Download Anna Seve here:",
+      "https://play.google.com/store/apps/details?id=in.gov.karnataka.ahara.annaseva",
+      "",
+      "🍎 IPHONE APP:",
+      "Find Anna Seve on the App Store:",
+      "https://apps.apple.com/in/search?term=Anna%20Seve",
+      "",
+      "If you need assistance with ration card e-KYC, please contact Team OSH.",
+      ""
+    );
+  } else {
+    lines.push(
+      "Our team will contact you shortly with the next steps for your request.",
+      ""
+    );
+  }
+
+  lines.push("Thank you for choosing OnlineSolutionHub! ❤️");
+
+  return lines.join("\n");
 }
 
 async function checkAcceptedRequests() {
-    if (isChecking || getWhatsAppStatus() !== "ready") {
-        return;
-    }
+  if (isChecking || getWhatsAppStatus() !== "ready") {
+    return;
+  }
 
-    isChecking = true;
+  if (mongoose.connection.readyState !== 1) {
+    console.warn(LOG_TAG, "MongoDB is not connected");
+    return;
+  }
 
-    try {
-        const requests = await Request.find({
-            paymentStatus: "Accepted"
-        }).lean();
+  isChecking = true;
 
-        for (const request of requests) {
-            const requestId = String(request._id);
+  try {
+    // Only requests that were never messaged and have not failed too often
+    const requests = await Request.find({
+      paymentStatus: "Accepted",
+      whatsappSentAt: null,
+      whatsappAttempts: { $not: { $gte: MAX_ATTEMPTS } },
+    }).lean();
 
-            if (processedRequestIds.has(requestId)) {
-                continue;
-            }
+    for (const request of requests) {
+      const requestId = String(request._id);
 
-            const message = createCustomerMessage(request);
+      if (!request.phoneNumber) {
+        console.error(LOG_TAG, "Missing phone number for request:", requestId);
+        continue;
+      }
 
-            if (!message) {
-                continue;
-            }
+      // Claim the request first so it can never be sent twice
+      const claimed = await Request.findOneAndUpdate(
+        { _id: request._id, whatsappSentAt: null },
+        { $set: { whatsappSentAt: new Date() } }
+      );
 
-            // Prevent duplicate attempts during this process session.
-            processedRequestIds.add(requestId);
+      if (!claimed) {
+        continue;
+      }
 
-            try {
-                await sendWhatsAppMessage(
-                    request.phoneNumber,
-                    message
-                );
+      try {
+        await sendWhatsAppMessage(
+          request.phoneNumber,
+          createCustomerMessage(request)
+        );
 
-                console.log(
-                    LOG_TAG,
-                    "Message sent for request:",
-                    requestId
-                );
-            } catch (error) {
-                processedRequestIds.delete(requestId);
+        console.log(LOG_TAG, "WhatsApp message sent for request:", requestId);
+      } catch (error) {
+        // Release the claim and count the failed attempt
+        await Request.updateOne(
+          { _id: request._id },
+          {
+            $set: { whatsappSentAt: null },
+            $inc: { whatsappAttempts: 1 },
+          }
+        );
 
-                console.error(
-                    LOG_TAG,
-                    "Message failed for request:",
-                    requestId,
-                    error.message
-                );
-            }
-        }
-    } catch (error) {
         console.error(
-            LOG_TAG,
-            "Database check failed:",
-            error.message
+          LOG_TAG,
+          "Message failed for request:",
+          requestId,
+          error.message
         );
-    } finally {
-        isChecking = false;
+      }
     }
+  } catch (error) {
+    console.error(LOG_TAG, "Database check failed:", error.message);
+  } finally {
+    isChecking = false;
+  }
 }
 
-async function startWatcher() {
-    // Keep MONGOOSE_KEY if this is the variable in your .env.
-    if (!process.env.MONGOOSE_KEY) {
-        throw new Error("MONGOOSE_KEY is missing from .env");
-    }
+function startWhatsAppWatcher() {
+  if (started) {
+    console.log(LOG_TAG, "Watcher already started");
+    return;
+  }
 
-    await mongoose.connect(process.env.MONGOOSE_KEY);
-
-    console.log(LOG_TAG, "MongoDB connected");
-
-    initializeWhatsApp();
-
-    const waitForConnection = setInterval(() => {
-        if (getWhatsAppStatus() !== "ready") {
-            console.log(LOG_TAG, "Waiting for WhatsApp...");
-            return;
-        }
-
-        clearInterval(waitForConnection);
-
-        console.log(LOG_TAG, "WhatsApp ready");
-        console.log(LOG_TAG, "Watching accepted payments");
-
-        checkAcceptedRequests();
-
-        pollIntervalId = setInterval(
-            checkAcceptedRequests,
-            POLL_INTERVAL
-        );
-    }, 5000);
-}
-
-startWatcher().catch((error) => {
-    console.error(
-        LOG_TAG,
-        "Startup failed:",
-        error.message
+  if (mongoose.connection.readyState !== 1) {
+    throw new Error(
+      "MongoDB must be connected before starting WhatsApp watcher"
     );
+  }
 
-    process.exit(1);
-});
+  started = true;
 
-process.on("SIGINT", async () => {
-    console.log(LOG_TAG, "Shutting down...");
+  console.log(LOG_TAG, "Using existing MongoDB connection");
 
-    if (pollIntervalId) {
-        clearInterval(pollIntervalId);
+  initializeWhatsApp();
+
+  // Poll continuously; checkAcceptedRequests skips while WhatsApp is not ready,
+  // so this also recovers automatically after a reconnect.
+  readyCheckId = setInterval(() => {
+    if (getWhatsAppStatus() === "ready") {
+      console.log(LOG_TAG, "WhatsApp ready, watching accepted payments");
+
+      clearInterval(readyCheckId);
+      readyCheckId = null;
+
+      checkAcceptedRequests();
     }
+  }, 3000);
 
-    await mongoose.disconnect();
+  pollIntervalId = setInterval(checkAcceptedRequests, POLL_INTERVAL);
+}
 
-    process.exit(0);
-});
+function stopWhatsAppWatcher() {
+  if (readyCheckId) {
+    clearInterval(readyCheckId);
+    readyCheckId = null;
+  }
+
+  if (pollIntervalId) {
+    clearInterval(pollIntervalId);
+    pollIntervalId = null;
+  }
+
+  started = false;
+}
+
+module.exports = {
+  startWhatsAppWatcher,
+  stopWhatsAppWatcher,
+};

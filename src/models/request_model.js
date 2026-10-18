@@ -36,7 +36,8 @@ const requestSchema = new mongoose.Schema({
         enum:["pending","received","in-progress","completed","cancelled"],
         default:"pending"
     },
-
+    whatsappSentAt: { type: Date, default: null },
+    whatsappAttempts: { type: Number, default: 0 },
     createdAt:{
         type:Number,
         required:true,
